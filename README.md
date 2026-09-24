@@ -1,15 +1,70 @@
 # CloudSentry — AI-Powered AWS Security Scanner
 
-CloudSentry is a read-only AWS security scanner built as a student portfolio project. It connects to an AWS account, inspects a small set of services, applies deterministic security rules, and returns structured findings through a FastAPI backend. Optionally, it uses Amazon Bedrock to explain those findings in plain English.
+## 1. Project overview
 
-The split of responsibilities is deliberate:
-
-- **The scanner decides.** Fixed rules in code detect every finding and assign its severity.
-- **Bedrock explains.** A language model adds a plain-English explanation, likely impact, and remediation context to findings the scanner has already produced. It never creates findings, changes severity, or looks at the AWS account.
+CloudSentry is a read-only AWS security scanner built as a student portfolio project. A web dashboard lets you pick a region and run a scan; a FastAPI backend inspects IAM, S3, EC2 security groups, CloudTrail and root account settings, applies deterministic security rules, and returns structured findings. Optionally, Amazon Bedrock adds a plain-English explanation to each finding.
 
 CloudSentry is not a replacement for AWS Security Hub, AWS Config, GuardDuty, IAM Access Analyzer, or a professional security review. It runs a limited set of checks and should be treated as a learning project.
 
-## What it scans
+## 2. Features
+
+- Twelve deterministic checks across IAM, S3, EC2, CloudTrail and the root account, each with a fixed severity
+- Read-only: the scanner never modifies AWS resources
+- Safe handling of missing permissions: a check that cannot conclude returns an `INFO` "unable to determine" result instead of assuming the worst
+- Optional Bedrock explanations (explanation, impact, remediation) for up to 10 of the most severe findings
+- Web dashboard: severity breakdown with filtering, findings list, finding details with evidence, and AI analysis shown separately from scanner results
+- Clear loading, empty, no-findings, error, backend-unavailable and AI-unavailable states
+- Simple EC2 deployment with no public inbound access
+
+## 3. Architecture
+
+```text
+Browser
+   │
+   ▼
+React / Vite dashboard  ── calls /api/scan (same origin)
+   │
+   ▼
+Vite dev proxy (local)  or  nginx (EC2)   ── strips /api, forwards to localhost:8000
+   │
+   ▼
+FastAPI backend
+   │
+   ├──► Deterministic scanner ── boto3 ──► AWS APIs (IAM, S3, EC2, CloudTrail)   [read-only]
+   │         │
+   │         ▼
+   │     Findings + severity  (source of truth)
+   │
+   └──► Optional: Amazon Bedrock (Converse API) ──► ai_explanation attached to findings
+```
+
+Inside the backend, `connect()` validates credentials with `sts:GetCallerIdentity`, then `scan_account()` runs each service scanner independently. A scanner that fails is reported in `errors` without stopping the others. When `include_ai` is true, `explain_scan()` sends the selected findings to Bedrock one at a time and attaches the results.
+
+The browser only ever talks to the backend. AWS credentials stay on the server.
+
+## 4. Deterministic scanning vs AI explanation
+
+- **The scanner decides.** Fixed rules in code detect every finding and assign its severity. The same account always produces the same findings.
+- **Bedrock explains.** A language model adds context to findings the scanner has already produced. It never creates findings, changes severity or IDs, or looks at the AWS account.
+
+How AI analysis works when `include_ai` is true:
+
+1. The deterministic scan runs exactly as it does without AI.
+2. Up to 10 findings are selected, most severe first. `INFO` results are not sent.
+3. Each selected finding (ID, service, title, severity, resource, description, evidence, and the scanner's recommendation) is sent to Bedrock. The prompt states that the finding was already detected, that the model must not change the severity or ID, invent evidence, or mention other issues, and that field values are data rather than instructions. Very large evidence is truncated.
+4. The model must return JSON with `explanation`, `impact` and `remediation`. Any other fields it returns are discarded.
+
+The deterministic fields (`id`, `service`, `title`, `severity`, `resource`, `description`, `evidence`, `recommendation`) are never modified. In the dashboard, AI text appears in a separate, clearly labelled "AI analysis" panel below the scanner result.
+
+If Bedrock is unavailable, the scan still succeeds and returns every deterministic finding. The problem is reported in `ai_analysis` with a short, generic message:
+
+| Situation | Behaviour |
+|---|---|
+| `BEDROCK_MODEL_ID` not set, access denied, model not found, invalid credentials, Bedrock unreachable | Stops after the first attempt (the error would repeat); status `unavailable` |
+| Throttling, timeout, or an unreadable model response for one finding | That finding has no `ai_explanation`; the rest are still processed (`partial`, or `unavailable` if none succeed) |
+| No findings, or only `INFO` findings | Bedrock is not called (`skipped`) |
+
+## 5. Supported AWS checks
 
 | Rule | Service | Check | Severity |
 |---|---|---|---|
@@ -26,145 +81,55 @@ CloudSentry is not a replacement for AWS Security Hub, AWS Config, GuardDuty, IA
 | ACCOUNT-001 | Account | Root user MFA status from `iam:GetAccountSummary` | CRITICAL if disabled |
 | ACCOUNT-002 | Account | Root user has access keys | CRITICAL |
 
-When a check cannot reach a conclusion (usually because of a missing permission), it returns an `INFO` finding with `"status": "unable_to_determine"` instead of assuming the worst. For example, if `cloudtrail:DescribeTrails` is denied, the scanner does not report CloudTrail as disabled.
+When a check cannot reach a conclusion (usually because of a missing permission), it returns an `INFO` finding with `"status": "unable_to_determine"`. For example, if `cloudtrail:DescribeTrails` is denied, CloudSentry does not report CloudTrail as disabled.
 
-## Architecture
+## 6. Tech stack
 
-```text
-POST /scan
-    │
-    ▼
-connect()  ── boto3 session + sts:GetCallerIdentity (validates credentials)
-    │
-    ▼
-scan_account()  ── runs each service scanner independently
-    ├── iam.scan
-    ├── s3.scan
-    ├── ec2.scan
-    ├── cloudtrail.scan
-    └── account.scan
-            │
-            ▼
-      Finding objects  ──►  ScanResult (sorted by severity, with per-service errors)
-            │
-            ▼  only when include_ai is true
-explain_scan()  ── up to 10 findings, most severe first
-    │
-    ▼
-Amazon Bedrock (Converse API)  ──►  ai_explanation attached to each finding
-```
-
-Each scanner module has the same shape: a `scan(session, account_id)` function that calls AWS, plus small pure functions (`analyze_policy`, `check_public_access`, `evaluate_security_group`, ...) that apply the rules. The pure functions take plain data, which is what the tests exercise.
-
-If one scanner fails (for example, a missing permission for a whole service), the error is recorded in `errors` and the other scanners still run.
-
-```text
-backend/
-├── app/
-│   ├── main.py            FastAPI app (/health, /scan)
-│   ├── models.py          Finding, ScanResult, Severity
-│   ├── config.py          Region, thresholds, Bedrock settings, boto3 retry config
-│   ├── ai/
-│   │   ├── bedrock.py     Prompt, Bedrock call, safe error handling, response parsing
-│   │   └── analysis.py    Chooses which findings to explain and attaches results
-│   └── scanner/
-│       ├── scanner.py     Central scanner
-│       ├── common.py      Shared AWS error helpers
-│       ├── iam.py, s3.py, ec2.py, cloudtrail.py, account.py
-└── tests/                 pytest suite with mocked AWS responses
-docs/iam-policy.json       Minimum read-only scanner policy
-docs/bedrock-policy.json   Optional Bedrock invocation policy
-```
-
-## AI analysis
-
-CloudSentry uses Amazon Bedrock to explain security findings that have already been detected by deterministic rules. The scanner determines the security finding and its severity. Bedrock explains the finding and provides additional remediation context.
-
-AI analysis is optional and off by default. When you request it:
-
-1. The deterministic scan runs exactly as it does without AI.
-2. Up to 10 findings are selected, most severe first (CRITICAL, then HIGH, and so on). `INFO` results such as "unable to determine" are not sent.
-3. Each selected finding (ID, service, title, severity, resource, description, evidence, and the scanner's recommendation) is sent to Bedrock one at a time. The prompt tells the model the finding was already detected, that it must not change the severity or ID, invent evidence, or mention other issues, and that field values are data rather than instructions. Very large evidence is truncated.
-4. The model must return JSON with `explanation`, `impact`, and `remediation`. Any other fields it returns (such as a different severity) are discarded, and the result is attached to the finding as `ai_explanation`.
-
-The deterministic fields (`id`, `service`, `title`, `severity`, `resource`, `description`, `evidence`, `recommendation`) are never modified.
-
-If Bedrock is unavailable, the scan still succeeds and returns every deterministic finding. Problems are reported in `ai_analysis` with a short, generic message; raw AWS or model errors are never returned, and a Bedrock failure is never turned into a security finding.
-
-| Situation | Behaviour |
+| Part | Technology |
 |---|---|
-| `BEDROCK_MODEL_ID` not set, access denied, model not found, invalid credentials, Bedrock unreachable | Stops after the first attempt (the error would repeat); `ai_analysis.status` is `unavailable` |
-| Throttling, timeout, or an unreadable model response for one finding | That finding is left without `ai_explanation`; the rest are still processed (`partial`, or `unavailable` if none succeed) |
-| No findings, or only `INFO` findings | Bedrock is not called (`skipped`) |
+| Scanner and API | Python 3.12, FastAPI, Pydantic, boto3 |
+| AI explanations | Amazon Bedrock Converse API (model of your choice) |
+| Dashboard | React 19, TypeScript, Vite, plain CSS |
+| Tests | pytest (backend), Vitest with jsdom (frontend) |
+| Deployment | One EC2 instance: nginx + systemd, instance role, Session Manager |
 
-### Choosing a model
+## 7. Local setup
 
-No model is hard-coded. Set `BEDROCK_MODEL_ID` to any text model or inference profile that supports the Bedrock Converse API and is available and enabled in your account and region (check the Bedrock console under Model access / Model catalog). Some models are only reachable through a cross-region inference profile ID rather than a plain model ID.
-
-Bedrock calls go to the scan region by default. If your chosen model is not available there, set `BEDROCK_REGION`.
-
-Each request is capped at 500 output tokens, and at most 10 requests are made per scan, so a scan with AI enabled makes at most 10 model calls. Requests run one after another, so an AI-enabled scan can take noticeably longer than a plain one. Bedrock usage is billed to your AWS account.
-
-## Setup
-
-Requires Python 3.12+.
+Requirements: Python 3.12+, Node.js 20.19+ or 22.12+, and AWS credentials for the account you want to scan.
 
 ```bash
+git clone https://github.com/dirirahmed/CloudSentry.git
+cd CloudSentry
+
+# Backend
 cd backend
 python -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
+cd ..
+
+# Frontend
+cd frontend
+npm install
 ```
 
-## AWS credentials
+### AWS credentials
 
-CloudSentry never stores or asks for credentials. It uses boto3's standard credential chain, so any of these work:
+CloudSentry never stores or asks for credentials. The backend uses boto3's standard credential chain, so any of these work:
 
 ```bash
-# Option 1: a named profile
-export AWS_PROFILE=cloudsentry-audit
-
-# Option 2: environment variables (for example, temporary credentials)
-export AWS_ACCESS_KEY_ID=...
-export AWS_SECRET_ACCESS_KEY=...
-export AWS_SESSION_TOKEN=...     # if using temporary credentials
-
-# Option 3: IAM Identity Center
-aws sso login --profile cloudsentry-audit
+export AWS_PROFILE=cloudsentry-audit                 # a named profile
+aws sso login --profile cloudsentry-audit           # IAM Identity Center
+export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_SESSION_TOKEN=...   # temporary credentials
 ```
 
-The region comes from the request body, then `AWS_REGION`, then your AWS config, and falls back to `us-east-1`. Temporary credentials from a dedicated read-only role are the safest option.
+Temporary credentials for a dedicated read-only role are the safest option. Do not use administrator credentials.
 
-### Configuration
+### Required AWS permissions
 
-| Variable | Required | Purpose |
-|---|---|---|
-| `AWS_REGION` | No | Default region to scan, e.g. `ca-central-1` |
-| `BEDROCK_MODEL_ID` | Only for AI analysis | Bedrock model or inference profile ID of your choice |
-| `BEDROCK_REGION` | No | Region for Bedrock calls if different from the scan region |
-| `CLOUDSENTRY_UNUSED_KEY_DAYS` | No | IAM-004 threshold in days (default `90`) |
+Permissions are split so the scanner stays read-only.
 
-```bash
-export AWS_REGION=ca-central-1
-export BEDROCK_MODEL_ID=your-model-id
-```
-
-On Windows PowerShell:
-
-```powershell
-$env:AWS_REGION = "ca-central-1"
-$env:BEDROCK_MODEL_ID = "your-model-id"
-```
-
-The server starts without any AWS credentials or Bedrock settings; they are only needed when a scan runs.
-
-## Required permissions
-
-Permissions are split into two separate policies so the scanner itself stays read-only.
-
-### Scanner (required, read-only)
-
-The scanner only calls read APIs and never modifies resources. The minimum policy is in [`docs/iam-policy.json`](docs/iam-policy.json):
+**Scanner (required, read-only)** — [`docs/iam-policy.json`](docs/iam-policy.json):
 
 | Service | Actions |
 |---|---|
@@ -173,41 +138,46 @@ The scanner only calls read APIs and never modifies resources. The minimum polic
 | EC2 | `DescribeSecurityGroups` |
 | CloudTrail | `DescribeTrails`, `GetTrailStatus` |
 
-`sts:GetCallerIdentity` needs no permission. The AWS managed `SecurityAudit` policy also covers everything above. Do not run the scanner with administrator credentials.
+`sts:GetCallerIdentity` needs no permission. The AWS managed `SecurityAudit` policy also covers everything above.
 
-### Bedrock (optional, only for AI analysis)
+**Bedrock (optional)** — [`docs/bedrock-policy.json`](docs/bedrock-policy.json) grants only `bedrock:InvokeModel`, which the Converse API uses. Narrow `Resource` to the ARN of the model you choose, and make sure that model is enabled for your account in the Bedrock console.
 
-[`docs/bedrock-policy.json`](docs/bedrock-policy.json) grants `bedrock:InvokeModel`, which the Converse API uses. It does not grant access to any other AWS resources. The example allows any foundation model or inference profile; narrow `Resource` to the ARN of the model you chose. The model must also be enabled for your account in the Bedrock console.
+## 8. Environment variables
 
-## Running the backend
+Backend (set in your shell locally, or in `/etc/cloudsentry.env` on EC2):
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `AWS_REGION` | No | Default region to scan, e.g. `ca-central-1` (falls back to your AWS config, then `us-east-1`) |
+| `BEDROCK_MODEL_ID` | Only for AI analysis | Bedrock model or inference profile ID of your choice |
+| `BEDROCK_REGION` | No | Region for Bedrock calls if different from the scan region |
+| `CLOUDSENTRY_UNUSED_KEY_DAYS` | No | IAM-004 threshold in days (default `90`) |
+
+Frontend (see [`frontend/.env.example`](frontend/.env.example)):
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `VITE_API_URL` | `/api` | Base path of the API as seen from the browser |
+
+Every `VITE_` variable is embedded in the public JavaScript bundle. Never put credentials in the frontend.
+
+**Choosing a Bedrock model:** no model is hard-coded. Set `BEDROCK_MODEL_ID` to any text model or inference profile that supports the Converse API and is available in your account and region (see the Bedrock console's model catalog). Some models are only reachable through a cross-region inference profile ID. Each request is capped at 500 output tokens, at most 10 requests are made per scan, and Bedrock usage is billed to your AWS account.
+
+## 9. Running the backend
 
 ```bash
 cd backend
-uvicorn app.main:app --reload
+uvicorn app.main:app --reload        # Windows: py -m uvicorn app.main:app --reload
 ```
 
-Then:
+The server starts without AWS credentials or Bedrock settings; they are only needed when a scan runs. Interactive API docs are at <http://localhost:8000/docs>.
 
-```bash
-curl http://localhost:8000/health
-curl -X POST http://localhost:8000/scan -H "Content-Type: application/json" -d '{"region": "ca-central-1"}'
+| Endpoint | Purpose |
+|---|---|
+| `GET /health` | Returns `{"status": "ok"}` |
+| `POST /scan` | Body (all optional): `{"region": "ca-central-1", "include_ai": false}` |
 
-# With Bedrock explanations
-curl -X POST http://localhost:8000/scan -H "Content-Type: application/json" -d '{"region": "ca-central-1", "include_ai": true}'
-```
-
-`POST /scan` accepts an optional body. Both fields are optional:
-
-| Field | Default | Meaning |
-|---|---|---|
-| `region` | see above | Region to scan |
-| `include_ai` | `false` | Add Bedrock explanations to findings |
-
-When `include_ai` is false or omitted, Bedrock is never called, every finding has `"ai_explanation": null`, and `ai_analysis` is `null`.
-
-Interactive API docs are at http://localhost:8000/docs.
-
-Error responses never include credentials or raw exception text:
+The response contains `account_id`, `region`, `scanned_at`, `resources_scanned`, `findings_count`, `severity_counts`, `findings` (each with the deterministic fields and `ai_explanation`, which is `null` unless AI added one), `errors` (services that could not be scanned) and `ai_analysis` (`null` when AI was not requested).
 
 | Situation | Response |
 |---|---|
@@ -216,90 +186,169 @@ Error responses never include credentials or raw exception text:
 | Cannot reach AWS | 503 |
 | Other AWS API error before scanning starts | 502 |
 | Unexpected failure | 500 (details only in server logs) |
-| One service denied or unavailable | 200 with the service listed in `errors` |
-| Bedrock unavailable or failing | 200 with all findings; details in `ai_analysis` |
+| One service denied or unavailable | 200, with the service listed in `errors` |
+| Bedrock unavailable or failing | 200, with all findings; details in `ai_analysis` |
 
-## Running tests
+Error responses never include credentials or raw exception text.
 
-Tests use mocked boto3 clients and a mocked Bedrock client. They never touch a real AWS account or call Bedrock.
+## 10. Running the frontend
+
+With the backend running on port 8000, in a second terminal:
+
+```bash
+cd frontend
+npm run dev
+```
+
+Open <http://localhost:5173>. The Vite dev server forwards `/api/*` to `http://127.0.0.1:8000`, so the browser sees one origin and the backend needs no CORS configuration.
+
+```bash
+npm run build      # type-check and build to frontend/dist
+npm run preview    # serve the production build locally (also proxies /api)
+```
+
+## 11. AWS deployment
+
+The deployment is a single EC2 instance that serves the dashboard with nginx and runs the API with systemd. It has **no inbound ports open**; you reach it through an AWS Systems Manager port-forwarding session. The configuration is in [`deploy/`](deploy/).
+
+**Why not a public website?** The API has no authentication by design. Anyone who could reach it could scan your account, read its security findings, and spend your Bedrock budget. Hosting the dashboard in a public S3 website bucket would also be flagged by CloudSentry's own S3-001 check. Keeping everything on one private instance avoids both problems, and needs no CORS, no public bucket and no extra services.
+
+These steps have not been run end to end by the author of this commit. Treat them as a starting point and check each step's output.
+
+**Prerequisites:** the AWS CLI v2 with credentials that can create IAM roles and EC2 instances, and the [Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html) installed locally.
+
+**1. Create the instance role** (from the repository root):
+
+```bash
+aws iam create-role --role-name CloudSentryEC2Role \
+  --assume-role-policy-document file://deploy/ec2-trust-policy.json
+aws iam attach-role-policy --role-name CloudSentryEC2Role \
+  --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+aws iam put-role-policy --role-name CloudSentryEC2Role \
+  --policy-name CloudSentryScannerReadOnly --policy-document file://docs/iam-policy.json
+# Optional, only for AI analysis:
+aws iam put-role-policy --role-name CloudSentryEC2Role \
+  --policy-name CloudSentryBedrockInvoke --policy-document file://docs/bedrock-policy.json
+
+aws iam create-instance-profile --instance-profile-name CloudSentryEC2Profile
+aws iam add-role-to-instance-profile --instance-profile-name CloudSentryEC2Profile \
+  --role-name CloudSentryEC2Role
+```
+
+`AmazonSSMManagedInstanceCore` is the AWS managed policy that lets Session Manager reach the instance. The role gets no write access to your resources.
+
+**2. Launch the instance** in the EC2 console:
+
+- AMI: Ubuntu Server 24.04 LTS; instance type `t3.small` (a `t3.micro` may run out of memory during `npm install`)
+- Key pair: none (Session Manager replaces SSH)
+- Network: a subnet with outbound internet access (for example, the default VPC with a public IP), and a new security group with **all inbound rules removed**
+- Advanced details: IAM instance profile `CloudSentryEC2Profile`, metadata version "V2 only"
+
+**3. Install CloudSentry** (wait a few minutes for the instance to register with Systems Manager):
+
+```bash
+aws ssm start-session --target i-0123456789abcdef0
+```
+
+Then, in the session:
+
+```bash
+sudo apt-get update && sudo apt-get install -y git
+sudo git clone https://github.com/dirirahmed/CloudSentry.git /opt/cloudsentry
+sudo bash /opt/cloudsentry/deploy/setup-ec2.sh
+sudo nano /etc/cloudsentry.env          # set AWS_REGION and, optionally, BEDROCK_MODEL_ID
+sudo systemctl restart cloudsentry
+curl -s localhost/api/health            # expect {"status":"ok"}
+```
+
+The setup script installs Python, Node.js 22, nginx and the app, builds the dashboard, and starts the `cloudsentry` service (listening on `127.0.0.1:8000`) behind nginx. The backend gets short-lived credentials from the instance role; no access keys are stored on the instance.
+
+**4. Open the dashboard** from your computer:
+
+```bash
+aws ssm start-session --target i-0123456789abcdef0 \
+  --document-name AWS-StartPortForwardingSession \
+  --parameters "portNumber"=["80"],"localPortNumber"=["8080"]
+```
+
+Leave that running and open <http://localhost:8080>.
+
+**Updating:** start a session and run `sudo bash /opt/cloudsentry/deploy/setup-ec2.sh` again.
+
+**Tearing down:** terminate the instance, then remove the instance profile and role (`remove-role-from-instance-profile`, `delete-instance-profile`, `delete-role-policy`, `detach-role-policy`, `delete-role`).
+
+Costs: the EC2 instance is billed while it runs, and Bedrock is billed per request. Stop the instance when you are not using it.
+
+## 12. Security considerations
+
+- **Credentials never reach the browser.** The dashboard only calls the CloudSentry API. The backend uses the standard AWS credential chain locally and the instance role on EC2.
+- **No public exposure.** The API has no authentication, so it is only reachable from `localhost` locally and through a Session Manager tunnel on EC2. Do not open the instance's security group to the internet.
+- **Least privilege.** The scanner policy is read-only. The Bedrock policy only allows `bedrock:InvokeModel`. Neither grants access to modify resources.
+- **Safe errors.** API errors return short, generic messages; details stay in server logs. The dashboard shows only those messages, never stack traces.
+- **Untrusted text is rendered as text.** Resource names, evidence and AI output are displayed as plain text (React escapes them), and nginx sends a strict Content Security Policy.
+- **Finding data goes to Bedrock when AI is enabled.** Resource names and evidence (for example policy statements and CIDR ranges) are included in prompts. AWS states that Bedrock does not use prompts to train models, but only enable AI analysis if sending this data to Bedrock is acceptable for your account.
+
+## 13. Limitations
+
+- **Limited coverage.** Only the checks listed above are run. GuardDuty, Config, KMS key policies, VPC flow logs, RDS, Lambda and many other controls are out of scope.
+- **One region per scan.** EC2 security groups and CloudTrail are evaluated for the chosen region. IAM and S3 are global.
+- **Simplified policy analysis.** AWS managed policies (such as `AdministratorAccess`) are not evaluated. `NotResource`, permission boundaries, SCPs, resource policies and role trust policies are not considered, so findings describe what a policy document allows, not an identity's effective permissions.
+- **Exposure is not proof of vulnerability.** A public bucket or open port can be intentional. The scanner does not check whether a security group is attached to anything.
+- **S3 public access** relies on AWS's own policy status evaluation and ACL grants; access points and object ACLs are not checked.
+- **Root account** MFA status comes from `iam:GetAccountSummary`; interpret it with care if root credentials are centrally managed through AWS Organizations.
+- **AI explanations can be wrong** and cover at most 10 findings per scan. The deterministic finding is authoritative.
+- **No accounts, history or scheduling.** Each scan is a single synchronous request; results are not stored. Very slow scans can hit the 300-second proxy timeout.
+- **No authentication.** Keep the API private as described above.
+
+## 14. Testing
+
+Backend tests use mocked boto3 and Bedrock clients and never touch a real AWS account:
 
 ```bash
 cd backend
-pytest
+py -m pytest          # or: python -m pytest
 ```
 
-## Example scan output
+Frontend tests use Vitest with jsdom and a mocked `fetch`; they cover the API client and the dashboard's states (empty, loading, results, AI analysis, AI unavailable, no findings, scan error, backend unavailable, invalid region):
 
-With `"include_ai": true` (AI text is illustrative):
-
-```json
-{
-  "account_id": "123456789012",
-  "region": "ca-central-1",
-  "scanned_at": "2026-09-23T14:02:11.482Z",
-  "resources_scanned": 18,
-  "findings_count": 3,
-  "severity_counts": {"CRITICAL": 0, "HIGH": 2, "MEDIUM": 0, "LOW": 0, "INFO": 1},
-  "findings": [
-    {
-      "id": "EC2-001",
-      "service": "EC2",
-      "title": "SSH exposed to the internet",
-      "severity": "HIGH",
-      "resource": "sg-0a1b2c3d4e5f67890",
-      "description": "Security group sg-0a1b2c3d4e5f67890 (web) allows SSH (TCP 22) from 0.0.0.0/0. This may be intentional, but it exposes any resource using this group to the whole internet.",
-      "evidence": {"group_name": "web", "vpc_id": "vpc-1234", "protocol": "tcp", "from_port": 22, "to_port": 22, "sources": ["0.0.0.0/0"]},
-      "recommendation": "Restrict port 22 to known IP ranges, or remove the rule and use AWS Systems Manager Session Manager or EC2 Instance Connect Endpoint for shell access.",
-      "ai_explanation": {
-        "explanation": "This security group lets any computer on the internet try to open an SSH connection to instances that use it.",
-        "impact": "Internet-facing SSH is constantly scanned by automated tools; a weak or leaked key or an unpatched SSH server could let someone log in.",
-        "remediation": "Remove the 0.0.0.0/0 rule and allow port 22 only from your own IP range, or switch to Session Manager so no inbound port is needed."
-      }
-    },
-    {
-      "id": "S3-001",
-      "service": "S3",
-      "title": "Potentially risky public access",
-      "severity": "HIGH",
-      "resource": "example-public-assets",
-      "description": "Bucket 'example-public-assets' appears to be publicly accessible through its bucket policy. ...",
-      "evidence": {"policy_is_public": true, "public_acl_grantees": [], "account_settings_known": true, "effective_block_public_access": {"BlockPublicAcls": false, "IgnorePublicAcls": false, "BlockPublicPolicy": false, "RestrictPublicBuckets": false}},
-      "recommendation": "Confirm the bucket is meant to be public. ...",
-      "ai_explanation": {"explanation": "...", "impact": "...", "remediation": "..."}
-    },
-    {
-      "id": "CT-001",
-      "service": "CloudTrail",
-      "title": "Unable to determine CloudTrail status",
-      "severity": "INFO",
-      "resource": "account/123456789012 (ca-central-1)",
-      "description": "The scanner could not determine the result of this check (access denied for cloudtrail:DescribeTrails). This is not evidence of a problem.",
-      "evidence": {"status": "unable_to_determine", "reason": "access denied for cloudtrail:DescribeTrails"},
-      "recommendation": "Grant the read-only permissions in docs/iam-policy.json and run the scan again.",
-      "ai_explanation": null
-    }
-  ],
-  "errors": [],
-  "ai_analysis": {
-    "status": "completed",
-    "model_id": "your-model-id",
-    "findings_selected": 2,
-    "findings_explained": 2,
-    "errors": []
-  }
-}
+```bash
+cd frontend
+npm test
+npm run build         # also type-checks
 ```
 
-## Security limitations
+## 15. Project structure
 
-- **Limited coverage.** Only the checks listed above are run. Many important controls (GuardDuty, Config, KMS key policies, VPC flow logs, RDS, Lambda, and more) are out of scope.
-- **Single region.** EC2 security groups and CloudTrail are evaluated for one region per scan. IAM and S3 are global.
-- **Policy analysis is simplified.** AWS managed policies (such as `AdministratorAccess`) are not evaluated, only customer-managed and inline policies. `NotResource`, permission boundaries, SCPs, resource policies, and role trust policies are not considered, so findings describe what a policy document allows, not the identity's effective permissions.
-- **Exposure is not proof of vulnerability.** A public bucket or open port can be intentional. The scanner does not check whether a security group is attached to anything or what is running behind it.
-- **S3 public access** relies on AWS's own policy status evaluation and ACL grants; access points and object-level ACLs are not checked.
-- **Root account.** Root MFA status comes from `iam:GetAccountSummary`. If root credentials are centrally managed through AWS Organizations, results should be interpreted with that in mind.
-- **Point-in-time results.** A scan reflects the account at the moment it ran.
-- **AI explanations can be wrong.** They are generated text based only on the finding's fields. Treat them as helpful context; the deterministic finding, evidence, and recommendation are authoritative.
-- **AI coverage is capped.** At most 10 findings per scan are explained; lower-severity findings beyond that are returned without an explanation.
-- **Finding data is sent to Bedrock.** Resource names and evidence (for example policy statements and CIDR ranges) are included in the prompt. AWS states that Bedrock does not use prompts to train models, but only enable AI analysis if sending this data to Bedrock is acceptable for your account.
-- **No authentication on the API.** Run it locally only; do not expose it to a network.
+```text
+CloudSentry/
+├── backend/
+│   ├── app/
+│   │   ├── main.py              FastAPI app (/health, /scan)
+│   │   ├── models.py            Finding, ScanResult, Severity, AI models
+│   │   ├── config.py            Region, thresholds, Bedrock settings
+│   │   ├── scanner/             Deterministic checks: iam, s3, ec2, cloudtrail, account
+│   │   └── ai/                  Bedrock prompt, call and parsing; finding selection
+│   ├── tests/                   pytest suite (mocked AWS and Bedrock)
+│   └── requirements.txt
+├── frontend/
+│   ├── src/
+│   │   ├── App.tsx              Page layout and scan state
+│   │   ├── api.ts               API client and error handling
+│   │   ├── types.ts             Types matching the backend models
+│   │   ├── components/          Controls, summary, findings list, details, AI panel, states
+│   │   ├── styles.css
+│   │   └── *.test.ts(x)         Vitest tests (test data lives in src/test/)
+│   ├── .env.example
+│   ├── package.json
+│   └── vite.config.ts           Dev proxy: /api -> 127.0.0.1:8000
+├── deploy/
+│   ├── setup-ec2.sh             Installs/updates CloudSentry on Ubuntu 24.04
+│   ├── nginx.conf               Serves the dashboard, proxies /api
+│   ├── cloudsentry.service      systemd unit for the API
+│   ├── cloudsentry.env.example  Backend settings on the instance
+│   └── ec2-trust-policy.json    Trust policy for the instance role
+├── docs/
+│   ├── iam-policy.json          Read-only scanner permissions
+│   └── bedrock-policy.json      Optional Bedrock invocation permission
+└── README.md
+```

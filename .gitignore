@@ -10,9 +10,15 @@ htmlcov/
 .venv/
 venv/
 
+# Node / Vite
+node_modules/
+frontend/dist/
+*.tsbuildinfo
+
 # Secrets and local config
 .env
 .env.*
+!.env.example
 *.pem
 .aws/
 

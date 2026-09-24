@@ -1,0 +1,20 @@
+[Unit]
+Description=CloudSentry API (FastAPI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=cloudsentry
+Group=cloudsentry
+WorkingDirectory=/opt/cloudsentry/backend
+EnvironmentFile=/etc/cloudsentry.env
+# Listens on localhost only; nginx is the only way in.
+ExecStart=/opt/cloudsentry/backend/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
+Restart=on-failure
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

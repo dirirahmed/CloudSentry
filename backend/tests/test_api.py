@@ -1,9 +1,13 @@
+from unittest.mock import MagicMock
+
 import pytest
 from botocore.exceptions import EndpointConnectionError
 from fastapi.testclient import TestClient
 
 from app import main
-from app.models import Finding, ScanResult, Severity
+from app.ai import bedrock
+from app.ai.bedrock import AIUnavailableError
+from app.models import AIExplanation, Finding, ScanResult, Severity
 from app.scanner.scanner import CredentialsError
 
 client = TestClient(main.app)
@@ -70,3 +74,80 @@ def test_scan_errors_map_to_safe_responses(monkeypatch, exc, status):
 
     assert response.status_code == status
     assert "secret-looking" not in response.text
+
+
+# Optional Bedrock analysis
+
+EXPLANATION = AIExplanation(
+    explanation="SSH is reachable from any IP address.",
+    impact="Attackers can try to brute-force logins.",
+    remediation="Limit port 22 to trusted ranges.",
+)
+
+
+def fake_bedrock(monkeypatch, side_effect=None):
+    """Replace BedrockService in the API with a mock and return the mock class."""
+    service_class = MagicMock()
+    instance = service_class.return_value
+    instance.model_id = "test-model-id"
+    instance.explain_finding.side_effect = side_effect or (lambda finding: EXPLANATION)
+    monkeypatch.setattr(main, "BedrockService", service_class)
+    monkeypatch.setattr(main, "run_scan", lambda region: fake_result())
+    return service_class
+
+
+def test_include_ai_false_does_not_call_bedrock(monkeypatch):
+    service_class = fake_bedrock(monkeypatch)
+
+    response = client.post("/scan", json={"include_ai": False})
+
+    assert response.status_code == 200
+    service_class.assert_not_called()
+    body = response.json()
+    assert body["findings"][0]["ai_explanation"] is None
+    assert body["ai_analysis"] is None
+
+
+def test_include_ai_true_attaches_explanations(monkeypatch):
+    service_class = fake_bedrock(monkeypatch)
+
+    response = client.post("/scan", json={"region": "ca-central-1", "include_ai": True})
+
+    assert response.status_code == 200
+    body = response.json()
+    finding = body["findings"][0]
+    assert finding["id"] == "EC2-001"
+    assert finding["severity"] == "HIGH"
+    assert finding["evidence"] == {"from_port": 22}
+    assert finding["recommendation"] == "r"
+    assert finding["ai_explanation"] == EXPLANATION.model_dump()
+    assert body["ai_analysis"]["status"] == "completed"
+    assert body["ai_analysis"]["findings_explained"] == 1
+    service_class.return_value.explain_finding.assert_called_once()
+
+
+def test_bedrock_failure_still_returns_deterministic_findings(monkeypatch):
+    fake_bedrock(monkeypatch, side_effect=AIUnavailableError(bedrock.ACCESS_DENIED, fatal=True))
+
+    response = client.post("/scan", json={"include_ai": True})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["findings_count"] == 1
+    assert body["findings"][0]["severity"] == "HIGH"
+    assert body["findings"][0]["ai_explanation"] is None
+    assert body["ai_analysis"]["status"] == "unavailable"
+    assert body["ai_analysis"]["errors"] == [bedrock.ACCESS_DENIED]
+
+
+def test_missing_model_id_returns_scan_with_ai_unavailable(monkeypatch):
+    monkeypatch.setattr(main, "run_scan", lambda region: fake_result())
+    monkeypatch.setattr(main, "BEDROCK_MODEL_ID", None)
+
+    response = client.post("/scan", json={"include_ai": True})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["findings_count"] == 1
+    assert body["ai_analysis"]["status"] == "unavailable"
+    assert body["ai_analysis"]["errors"] == [bedrock.NOT_CONFIGURED]

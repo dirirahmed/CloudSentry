@@ -3,7 +3,7 @@ import json
 import pytest
 from pydantic import ValidationError
 
-from app.models import Finding, ScanResult, ServiceError, Severity
+from app.models import AIExplanation, Finding, ScanResult, ServiceError, Severity
 
 
 def make_finding(severity=Severity.HIGH, rule_id="EC2-001", resource="sg-123456"):
@@ -39,7 +39,10 @@ def test_finding_serialization_round_trip():
 
     assert payload["severity"] == "HIGH"
     assert payload["evidence"] == {"sources": ["0.0.0.0/0"], "from_port": 22}
-    assert set(payload) == {"id", "service", "title", "severity", "resource", "description", "evidence", "recommendation"}
+    assert set(payload) == {
+        "id", "service", "title", "severity", "resource", "description", "evidence", "recommendation", "ai_explanation",
+    }
+    assert payload["ai_explanation"] is None
     assert Finding.model_validate(payload) == finding
 
 
@@ -56,3 +59,15 @@ def test_scan_result_sorts_and_counts_findings():
     assert result.findings_count == 3
     assert result.severity_counts == {"CRITICAL": 1, "HIGH": 1, "MEDIUM": 0, "LOW": 1, "INFO": 0}
     assert json.loads(result.model_dump_json())["errors"][0]["service"] == "S3"
+
+
+def test_ai_explanation_ignores_extra_fields_from_the_model():
+    explanation = AIExplanation.model_validate(
+        {"explanation": "e", "impact": "i", "remediation": "r", "severity": "LOW", "id": "OTHER-001"}
+    )
+    assert explanation.model_dump() == {"explanation": "e", "impact": "i", "remediation": "r"}
+
+
+def test_ai_explanation_rejects_empty_fields():
+    with pytest.raises(ValidationError):
+        AIExplanation(explanation=" ", impact="i", remediation="r")

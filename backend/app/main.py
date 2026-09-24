@@ -5,22 +5,26 @@ from botocore.exceptions import ConnectionError as AWSConnectionError
 from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel, Field
 
+from app.ai.analysis import explain_scan
+from app.ai.bedrock import BedrockService
+from app.config import BEDROCK_MODEL_ID, BEDROCK_REGION
 from app.models import ScanResult
 from app.scanner.common import error_code
 from app.scanner.scanner import CredentialsError, run_scan
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("cloudguard")
+logger = logging.getLogger("cloudsentry")
 
 app = FastAPI(
-    title="CloudGuard AI",
-    version="0.1.0",
-    description="Read-only AWS security scanner using deterministic rules.",
+    title="CloudSentry",
+    version="0.2.0",
+    description="Read-only AWS security scanner using deterministic rules, with optional Bedrock explanations.",
 )
 
 
 class ScanRequest(BaseModel):
     region: str | None = Field(default=None, pattern=r"^[a-z]{2}(-[a-z]+)+-\d{1,2}$", examples=["ca-central-1"])
+    include_ai: bool = False
 
 
 @app.get("/health")
@@ -30,9 +34,9 @@ def health() -> dict[str, str]:
 
 @app.post("/scan", response_model=ScanResult)
 def scan(request: ScanRequest | None = None) -> ScanResult:
-    region = request.region if request else None
+    request = request or ScanRequest()
     try:
-        return run_scan(region)
+        result = run_scan(request.region)
     except CredentialsError as exc:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, str(exc)) from exc
     except AWSConnectionError as exc:
@@ -43,3 +47,8 @@ def scan(request: ScanRequest | None = None) -> ScanResult:
     except Exception as exc:
         logger.exception("Scan failed")
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Unexpected error while running the scan.") from exc
+
+    if request.include_ai:
+        service = BedrockService(model_id=BEDROCK_MODEL_ID, region=BEDROCK_REGION or result.region)
+        result = explain_scan(result, service)
+    return result

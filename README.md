@@ -1,5 +1,7 @@
 # CloudSentry — AI-Powered AWS Security Scanner
 
+[![CI](https://github.com/dirirahmed/CloudSentry/actions/workflows/ci.yml/badge.svg)](https://github.com/dirirahmed/CloudSentry/actions/workflows/ci.yml)
+
 ## 1. Project overview
 
 CloudSentry is a read-only AWS security scanner built as a student portfolio project. A web dashboard lets you pick a region and run a scan; a FastAPI backend inspects IAM, S3, EC2 security groups, CloudTrail and root account settings, applies deterministic security rules, and returns structured findings. Optionally, Amazon Bedrock adds a plain-English explanation to each finding.
@@ -317,10 +319,15 @@ npm test
 npm run build         # also type-checks
 ```
 
+### Continuous integration
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every push to `main` and on pull requests. It runs the backend tests on Python 3.12, and the frontend tests and production build on Node.js 22. The workflow has no AWS credentials and only read access to the repository; every AWS and Bedrock call in the tests is mocked.
+
 ## 15. Project structure
 
 ```text
 CloudSentry/
+├── .github/workflows/ci.yml     Tests and build on every push and pull request
 ├── backend/
 │   ├── app/
 │   │   ├── main.py              FastAPI app (/health, /scan)

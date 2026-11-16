@@ -12,9 +12,11 @@ const apiProxy = {
   },
 };
 
+// Listen on 127.0.0.1 explicitly: on some Windows machines "localhost" resolves to an address
+// the browser cannot reach, and the page times out.
 export default defineConfig({
   plugins: [react()],
-  server: { proxy: apiProxy },
-  preview: { proxy: apiProxy },
+  server: { host: "127.0.0.1", proxy: apiProxy },
+  preview: { host: "127.0.0.1", proxy: apiProxy },
   test: { environment: "jsdom" },
 });

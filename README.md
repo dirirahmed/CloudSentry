@@ -206,7 +206,7 @@ cd frontend
 npm run dev
 ```
 
-Open <http://localhost:5173>. The Vite dev server forwards `/api/*` to `http://127.0.0.1:8000`, so the browser sees one origin and the backend needs no CORS configuration.
+Open <http://127.0.0.1:5173>. The Vite dev server forwards `/api/*` to `http://127.0.0.1:8000`, so the browser sees one origin and the backend needs no CORS configuration.
 
 ```bash
 npm run build      # type-check and build to frontend/dist

@@ -6,6 +6,7 @@ import Header from "./components/Header";
 import ScanControls from "./components/ScanControls";
 import ScanNotices from "./components/ScanNotices";
 import ScanSummary from "./components/ScanSummary";
+import DemoBanner from "./components/DemoBanner";
 import { EmptyState, ErrorState, LoadingState, NoFindings } from "./components/StatusPanels";
 import type { ApiStatus, ScanRequest, ScanResult, Severity } from "./types";
 
@@ -15,7 +16,12 @@ type ScanState =
   | { status: "success"; result: ScanResult }
   | { status: "error"; error: ApiError };
 
-export default function App() {
+interface Props {
+  /** Public demo build: shows the sandbox banner and never requests AI analysis. */
+  demoMode?: boolean;
+}
+
+export default function App({ demoMode = false }: Props) {
   const [region, setRegion] = useState("");
   const [includeAi, setIncludeAi] = useState(false);
   const [scan, setScan] = useState<ScanState>({ status: "idle" });
@@ -34,7 +40,7 @@ export default function App() {
   }, []);
 
   async function handleScan() {
-    const request: ScanRequest = { include_ai: includeAi };
+    const request: ScanRequest = { include_ai: includeAi && !demoMode };
     if (region.trim()) request.region = region.trim();
 
     setScan({ status: "loading", request });
@@ -82,10 +88,12 @@ export default function App() {
     <div className="app">
       <Header apiStatus={apiStatus} />
       <main>
+        {demoMode && <DemoBanner />}
         <ScanControls
           region={region}
           includeAi={includeAi}
           scanning={scan.status === "loading"}
+          demoMode={demoMode}
           onRegionChange={setRegion}
           onIncludeAiChange={setIncludeAi}
           onScan={handleScan}

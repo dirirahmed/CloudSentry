@@ -16,7 +16,7 @@ CloudSentry is not a replacement for AWS Security Hub, AWS Config, GuardDuty, IA
 - Optional Bedrock explanations (explanation, impact, remediation) for up to 10 of the most severe findings
 - Web dashboard: severity breakdown with filtering, findings list, finding details with evidence, and AI analysis shown separately from scanner results
 - Clear loading, empty, no-findings, error, backend-unavailable and AI-unavailable states
-- Simple EC2 deployment with no public inbound access
+- Public demo on AWS that stays online at no cost within the AWS always-free limits (CloudFront, S3 and Lambda), deployed with one script; or a private EC2 deployment
 
 ## 3. Architecture
 
@@ -27,10 +27,13 @@ Browser
 React / Vite dashboard  ── calls /api/scan (same origin)
    │
    ▼
-Vite dev proxy (local)  or  nginx (EC2)   ── strips /api, forwards to localhost:8000
+Local:        Vite dev proxy ── strips /api ──► FastAPI on localhost:8000
+Public demo:  CloudFront ── /api/* ──► Lambda function URL (FastAPI through Mangum)
+                         └─ /*     ──► private S3 bucket (built dashboard)
+Private EC2:  nginx ── strips /api ──► FastAPI on localhost:8000
    │
    ▼
-FastAPI backend
+FastAPI backend (the same app in every setup)
    │
    ├──► Deterministic scanner ── boto3 ──► AWS APIs (IAM, S3, EC2, CloudTrail)   [read-only]
    │         │
@@ -93,7 +96,7 @@ When a check cannot reach a conclusion (usually because of a missing permission)
 | AI explanations | Amazon Bedrock Converse API (model of your choice) |
 | Dashboard | React 19, TypeScript, Vite, plain CSS |
 | Tests | pytest (backend), Vitest with jsdom (frontend) |
-| Deployment | One EC2 instance: nginx + systemd, instance role, Session Manager |
+| Deployment | Public demo: CloudFront, S3 and Lambda, defined in one CloudFormation template. Private option: one EC2 instance with nginx and systemd |
 
 ## 7. Local setup
 
@@ -160,6 +163,7 @@ Frontend (see [`frontend/.env.example`](frontend/.env.example)):
 | Variable | Default | Purpose |
 |---|---|---|
 | `VITE_API_URL` | `/api` | Base path of the API as seen from the browser |
+| `VITE_DEMO_MODE` | `false` | `true` builds the public demo: a banner explains the sandbox account and the AI toggle is replaced by a note |
 
 Every `VITE_` variable is embedded in the public JavaScript bundle. Never put credentials in the frontend.
 
@@ -211,11 +215,56 @@ npm run preview    # serve the production build locally (also proxies /api)
 
 ## 11. AWS deployment
 
-The deployment is a single EC2 instance that serves the dashboard with nginx and runs the API with systemd. It has **no inbound ports open**; you reach it through an AWS Systems Manager port-forwarding session. The configuration is in [`deploy/`](deploy/).
+There are two ways to run CloudSentry on AWS:
 
-**Why not a public website?** The API has no authentication by design. Anyone who could reach it could scan your account, read its security findings, and spend your Bedrock budget. Hosting the dashboard in a public S3 website bucket would also be flagged by CloudSentry's own S3-001 check. Keeping everything on one private instance avoids both problems, and needs no CORS, no public bucket and no extra services.
+- **Option A, public demo:** a live link anyone can open, for example from a resume. It scans a dedicated sandbox account and costs nothing within the AWS always-free limits.
+- **Option B, private instance:** only you can reach it. Use it to scan a real account, with AI analysis if you want it.
 
-These steps have not been run end to end by the author of this commit. Treat them as a starting point and check each step's output.
+### Option A: Public demo (serverless)
+
+[`deploy/serverless/template.yaml`](deploy/serverless/template.yaml) defines everything as one CloudFormation stack, and [`deploy/serverless/deploy.sh`](deploy/serverless/deploy.sh) builds and deploys it from AWS CloudShell. Nothing needs to be installed on your computer.
+
+| Part | What it is |
+|---|---|
+| CloudFront distribution | The public HTTPS address. Serves the dashboard and forwards `/api/*` to Lambda |
+| Private S3 bucket | Holds the built dashboard. Only this CloudFront distribution can read it |
+| Lambda function | The same FastAPI app, run through [Mangum](https://github.com/Kludex/mangum). Its function URL uses IAM auth, so only CloudFront can call it (origin access control) |
+| Lambda role | The read-only scanner permissions from `docs/iam-policy.json`, plus permission to write logs. No Bedrock access |
+| Demo resources | Three IAM policies, three security groups, an empty VPC and an empty bucket, each insecure on purpose so the scanner has something to find. None of them is attached to anything, so they expose nothing |
+| Budget alert (optional) | Emails you as soon as the account is charged anything |
+
+**Why a sandbox account?** The public demo has no login, so anyone who opens it can scan whichever account it runs in and see the results. Deploy it only in a separate, empty AWS account, never in an account with real resources.
+
+**Cost:** CloudFront, Lambda and CloudWatch Logs all have monthly allowances in the AWS always-free tier, and a portfolio demo uses a tiny fraction of them. The dashboard is under 1 MB in S3. AI analysis is turned off, so there are no Bedrock charges. Set `ALERT_EMAIL` so that any unexpected charge reaches you quickly.
+
+These steps have not been run end to end yet. CloudFormation rolls back on its own if a step fails.
+
+**1. Create a sandbox account.** In your main AWS account, open **AWS Organizations**, then **Add an AWS account** → **Create an AWS account**. Name it, for example, `cloudsentry-sandbox`, and give it an email address you control that is not already used by an AWS account (with Gmail, `you+cloudsentry@gmail.com` works).
+
+**2. Sign in to it.** From the account menu in the top right of the console, choose **Switch role**, enter the new account's 12-digit ID and the role name `OrganizationAccountAccessRole`, and confirm. Pick your region in the top bar (for example **Canada (Central)**).
+
+**3. Deploy from CloudShell.** Open **CloudShell** (the terminal icon in the top bar) and run:
+
+```bash
+cd /tmp && git clone https://github.com/dirirahmed/CloudSentry.git && cd CloudSentry
+ALERT_EMAIL=you@example.com bash deploy/serverless/deploy.sh
+```
+
+The script packages the backend for Lambda, deploys the stack (about 5–10 minutes the first time), builds the dashboard and uploads it. It finishes by printing the address, which looks like `https://d1234abcd.cloudfront.net`. A new CloudFront address can take a few more minutes to start answering.
+
+**4. Check it.** Open the address and run a scan. You should see the planted findings: a CRITICAL wildcard admin policy (IAM-001); HIGH findings for an `iam:PassRole` policy (IAM-002) and for open SSH and RDP (EC2-001, EC2-002); MEDIUM findings for an `s3:*` policy (IAM-001) and an open PostgreSQL port (EC2-003); and a LOW finding for a bucket with only partial Block Public Access (S3-001). If the account has no CloudTrail trail you will also see CT-001, and the root account check (ACCOUNT-001) reports what AWS returns for the new account.
+
+**Updating after a push:** open CloudShell in the sandbox account and run the two commands from step 3 again. CloudShell clears `/tmp` between sessions, so cloning again is expected.
+
+**Removing it:** run `bash deploy/serverless/teardown.sh` from the cloned repository. It empties the dashboard bucket, deletes the stack (CloudFront takes 10–20 minutes) and removes the bucket that held the Lambda package.
+
+### Option B: Private EC2 instance
+
+This option is a single EC2 instance that serves the dashboard with nginx and runs the API with systemd. It has **no inbound ports open**; you reach it through an AWS Systems Manager port-forwarding session. The configuration is in [`deploy/`](deploy/).
+
+Use it to scan a real account with AI analysis enabled: the API has no authentication, so it must not be public when it can scan an account you care about.
+
+These steps have not been run end to end yet. Treat them as a starting point and check each step's output.
 
 **Prerequisites:** the AWS CLI v2 with credentials that can create IAM roles and EC2 instances, and the [Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html) installed locally.
 
@@ -283,11 +332,11 @@ Costs: the EC2 instance is billed while it runs, and Bedrock is billed per reque
 
 ## 12. Security considerations
 
-- **Credentials never reach the browser.** The dashboard only calls the CloudSentry API. The backend uses the standard AWS credential chain locally and the instance role on EC2.
-- **No public exposure.** The API has no authentication, so it is only reachable from `localhost` locally and through a Session Manager tunnel on EC2. Do not open the instance's security group to the internet.
+- **Credentials never reach the browser.** The dashboard only calls the CloudSentry API. The backend uses the standard AWS credential chain locally, the function's role on Lambda, and the instance role on EC2.
+- **Public only where it is safe.** The API has no authentication. The public demo is therefore limited to a sandbox account with a read-only role and no Bedrock access. Its Lambda function and S3 bucket only accept requests from its CloudFront distribution (origin access control). Locally the API listens on `localhost`, and on EC2 it is reachable only through a Session Manager tunnel.
 - **Least privilege.** The scanner policy is read-only. The Bedrock policy only allows `bedrock:InvokeModel`. Neither grants access to modify resources.
 - **Safe errors.** API errors return short, generic messages; details stay in server logs. The dashboard shows only those messages, never stack traces.
-- **Untrusted text is rendered as text.** Resource names, evidence and AI output are displayed as plain text (React escapes them), and nginx sends a strict Content Security Policy.
+- **Untrusted text is rendered as text.** Resource names, evidence and AI output are displayed as plain text (React escapes them), and CloudFront (or nginx on EC2) sends a strict Content Security Policy.
 - **Finding data goes to Bedrock when AI is enabled.** Resource names and evidence (for example policy statements and CIDR ranges) are included in prompts. AWS states that Bedrock does not use prompts to train models, but only enable AI analysis if sending this data to Bedrock is acceptable for your account.
 
 ## 13. Limitations
@@ -299,19 +348,20 @@ Costs: the EC2 instance is billed while it runs, and Bedrock is billed per reque
 - **S3 public access** relies on AWS's own policy status evaluation and ACL grants; access points and object ACLs are not checked.
 - **Root account** MFA status comes from `iam:GetAccountSummary`; interpret it with care if root credentials are centrally managed through AWS Organizations.
 - **AI explanations can be wrong** and cover at most 10 findings per scan. The deterministic finding is authoritative.
-- **No accounts, history or scheduling.** Each scan is a single synchronous request; results are not stored. Very slow scans can hit the 300-second proxy timeout.
-- **No authentication.** Keep the API private as described above.
+- **No accounts, history or scheduling.** Each scan is a single synchronous request; results are not stored. On the public demo a scan must finish within 60 seconds (the CloudFront and Lambda limit); on EC2 the limit is 300 seconds.
+- **No authentication.** Keep the API private unless it can only scan a sandbox account, as in the public demo.
+- **No per-visitor rate limit on the public demo.** That would need AWS WAF, which is not free. Scans cost nothing within the free tier, and the budget alert catches unusual use.
 
 ## 14. Testing
 
-Backend tests use mocked boto3 and Bedrock clients and never touch a real AWS account:
+Backend tests use mocked boto3 and Bedrock clients and never touch a real AWS account. They also run the Lambda entry point with sample function URL events:
 
 ```bash
 cd backend
 py -m pytest          # or: python -m pytest
 ```
 
-Frontend tests use Vitest with jsdom and a mocked `fetch`; they cover the API client and the dashboard's states (empty, loading, results, AI analysis, AI unavailable, no findings, scan error, backend unavailable, invalid region):
+Frontend tests use Vitest with jsdom and a mocked `fetch`; they cover the API client and the dashboard's states (empty, loading, results, AI analysis, AI unavailable, no findings, scan error, backend unavailable, rate-limited, invalid region, and the public demo mode):
 
 ```bash
 cd frontend
@@ -321,22 +371,24 @@ npm run build         # also type-checks
 
 ### Continuous integration
 
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every push to `main` and on pull requests. It runs the backend tests on Python 3.12, and the frontend tests and production build on Node.js 22. The workflow has no AWS credentials and only read access to the repository; every AWS and Bedrock call in the tests is mocked.
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every push to `main` and on pull requests. It runs the backend tests on Python 3.12, the frontend tests and production build on Node.js 22, and checks the deployment files with cfn-lint and ShellCheck. The workflow has no AWS credentials and only read access to the repository; every AWS and Bedrock call in the tests is mocked.
 
 ## 15. Project structure
 
 ```text
 CloudSentry/
-├── .github/workflows/ci.yml     Tests and build on every push and pull request
+├── .github/workflows/ci.yml     Tests, build and deployment checks on every push and pull request
 ├── backend/
 │   ├── app/
 │   │   ├── main.py              FastAPI app (/health, /scan)
+│   │   ├── lambda_handler.py    Runs the same app on AWS Lambda (public demo)
 │   │   ├── models.py            Finding, ScanResult, Severity, AI models
 │   │   ├── config.py            Region, thresholds, Bedrock settings
 │   │   ├── scanner/             Deterministic checks: iam, s3, ec2, cloudtrail, account
 │   │   └── ai/                  Bedrock prompt, call and parsing; finding selection
 │   ├── tests/                   pytest suite (mocked AWS and Bedrock)
-│   └── requirements.txt
+│   ├── requirements.txt
+│   └── requirements-lambda.txt  What the Lambda package needs
 ├── frontend/
 │   ├── src/
 │   │   ├── App.tsx              Page layout and scan state
@@ -349,7 +401,8 @@ CloudSentry/
 │   ├── package.json
 │   └── vite.config.ts           Dev proxy: /api -> 127.0.0.1:8000
 ├── deploy/
-│   ├── setup-ec2.sh             Installs/updates CloudSentry on Ubuntu 24.04
+│   ├── serverless/              Public demo: CloudFormation template, deploy and teardown scripts
+│   ├── setup-ec2.sh             Private EC2 option: installs/updates CloudSentry on Ubuntu 24.04
 │   ├── nginx.conf               Serves the dashboard, proxies /api
 │   ├── cloudsentry.service      systemd unit for the API
 │   ├── cloudsentry.env.example  Backend settings on the instance

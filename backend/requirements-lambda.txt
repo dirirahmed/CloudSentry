@@ -1,0 +1,5 @@
+# Packaged into the Lambda function by deploy/serverless/deploy.sh.
+# boto3 is already part of the Lambda Python runtime, and uvicorn/pytest are not needed there.
+fastapi>=0.115
+pydantic>=2.7
+mangum>=0.19

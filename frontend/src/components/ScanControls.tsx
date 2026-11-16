@@ -12,12 +12,21 @@ interface Props {
   region: string;
   includeAi: boolean;
   scanning: boolean;
+  demoMode?: boolean;
   onRegionChange: (region: string) => void;
   onIncludeAiChange: (includeAi: boolean) => void;
   onScan: () => void;
 }
 
-export default function ScanControls({ region, includeAi, scanning, onRegionChange, onIncludeAiChange, onScan }: Props) {
+export default function ScanControls({
+  region,
+  includeAi,
+  scanning,
+  demoMode = false,
+  onRegionChange,
+  onIncludeAiChange,
+  onScan,
+}: Props) {
   const trimmed = region.trim();
   const regionInvalid = trimmed !== "" && !REGION_PATTERN.test(trimmed);
 
@@ -48,24 +57,38 @@ export default function ScanControls({ region, includeAi, scanning, onRegionChan
           ))}
         </datalist>
         <p id="region-help" className={regionInvalid ? "field-help field-error" : "field-help"}>
-          {regionInvalid ? "Use a region code such as ca-central-1." : "Leave empty to use the backend's AWS_REGION."}
+          {regionInvalid
+            ? "Use a region code such as ca-central-1."
+            : demoMode
+              ? "Leave empty to scan the region where the demo resources live."
+              : "Leave empty to use the backend's AWS_REGION."}
         </p>
       </div>
 
-      <div className="field">
-        <label className="toggle">
-          <input
-            type="checkbox"
-            role="switch"
-            checked={includeAi}
-            disabled={scanning}
-            onChange={(event) => onIncludeAiChange(event.target.checked)}
-          />
-          <span className="toggle-track" aria-hidden="true" />
-          Include AI analysis
-        </label>
-        <p className="field-help">Amazon Bedrock explains findings. It never changes severity.</p>
-      </div>
+      {demoMode ? (
+        <div className="field">
+          <p className="field-label">AI analysis</p>
+          <p className="field-help">
+            Turned off in the live demo. With Amazon Bedrock enabled, CloudSentry adds plain-English explanations to
+            findings. It never changes severity.
+          </p>
+        </div>
+      ) : (
+        <div className="field">
+          <label className="toggle">
+            <input
+              type="checkbox"
+              role="switch"
+              checked={includeAi}
+              disabled={scanning}
+              onChange={(event) => onIncludeAiChange(event.target.checked)}
+            />
+            <span className="toggle-track" aria-hidden="true" />
+            Include AI analysis
+          </label>
+          <p className="field-help">Amazon Bedrock explains findings. It never changes severity.</p>
+        </div>
+      )}
 
       <button type="submit" className="scan-button" disabled={scanning || regionInvalid}>
         {scanning ? "Scanning…" : "Run security scan"}

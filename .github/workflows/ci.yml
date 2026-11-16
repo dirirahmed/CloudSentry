@@ -56,3 +56,18 @@ jobs:
       - run: npm ci
       - run: npm test
       - run: npm run build
+
+  deploy-config:
+    name: Deployment config
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip install cfn-lint==1.60.1
+      - run: cfn-lint deploy/serverless/template.yaml
+      - run: shellcheck deploy/setup-ec2.sh deploy/serverless/*.sh

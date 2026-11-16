@@ -34,9 +34,18 @@ async function flush() {
   });
 }
 
-async function renderApp() {
+async function waitFor(check: () => boolean) {
+  for (let attempt = 0; attempt < 50 && !check(); attempt++) await flush();
+}
+
+/** Waits until the scan request has finished (it starts after the body hash is computed). */
+async function waitForScan() {
+  await waitFor(() => container.querySelector(".spinner") === null);
+}
+
+async function renderApp(demoMode = false) {
   root = createRoot(container);
-  act(() => root.render(<App />));
+  act(() => root.render(<App demoMode={demoMode} />));
   await flush();
 }
 
@@ -63,7 +72,7 @@ async function runScanWith(result: ScanResult) {
   mockApi(async () => jsonResponse(result));
   await renderApp();
   act(() => query<HTMLButtonElement>(".scan-button").click());
-  await flush();
+  await waitForScan();
 }
 
 describe("CloudSentry dashboard", () => {
@@ -87,6 +96,7 @@ describe("CloudSentry dashboard", () => {
     expect(text()).toContain("Scanning your AWS account");
     expect(query<HTMLButtonElement>(".scan-button").disabled).toBe(true);
 
+    await waitFor(() => fetchMock.mock.calls.some(([url]) => url.endsWith("/scan")));
     const scanCall = fetchMock.mock.calls.find(([url]) => url.endsWith("/scan"));
     expect(JSON.parse((scanCall as unknown as [string, RequestInit])[1].body as string)).toEqual({
       include_ai: true,
@@ -94,7 +104,7 @@ describe("CloudSentry dashboard", () => {
     });
 
     finish(jsonResponse(makeScanResult()));
-    await flush();
+    await waitForScan();
 
     expect(text()).not.toContain("Scanning your AWS account");
     expect(text()).toContain("SSH exposed to the internet");
@@ -177,7 +187,7 @@ describe("CloudSentry dashboard", () => {
     mockApi(async () => jsonResponse({ detail: "AWS rejected the credentials. They may be invalid or expired." }, 401));
     await renderApp();
     act(() => query<HTMLButtonElement>(".scan-button").click());
-    await flush();
+    await waitForScan();
 
     expect(query('[role="alert"]').textContent).toContain("Scan failed");
     expect(text()).toContain("AWS rejected the credentials.");
@@ -189,10 +199,43 @@ describe("CloudSentry dashboard", () => {
     expect(text()).toContain("API unreachable");
 
     act(() => query<HTMLButtonElement>(".scan-button").click());
-    await flush();
+    await waitForScan();
 
     expect(query('[role="alert"]').textContent).toContain("Backend unavailable");
     expect(text()).not.toContain("TypeError");
+  });
+
+  it("explains the sandbox and never requests AI analysis in demo mode", async () => {
+    const fetchMock = mockApi(async () => jsonResponse(makeScanResult()));
+    await renderApp(true);
+
+    expect(query(".demo-banner").textContent).toContain("sandbox AWS account");
+    expect(container.querySelector('input[role="switch"]')).toBeNull();
+    expect(text()).toContain("Turned off in the live demo.");
+
+    act(() => query<HTMLButtonElement>(".scan-button").click());
+    await waitForScan();
+
+    const scanCall = fetchMock.mock.calls.find(([url]) => url.endsWith("/scan"));
+    expect(JSON.parse((scanCall as unknown as [string, RequestInit])[1].body as string)).toEqual({ include_ai: false });
+    expect(text()).toContain("SSH exposed to the internet");
+  });
+
+  it("shows the AI toggle and no demo banner by default", async () => {
+    mockApi(async () => jsonResponse(makeScanResult()));
+    await renderApp();
+
+    expect(container.querySelector(".demo-banner")).toBeNull();
+    expect(container.querySelector('input[role="switch"]')).not.toBeNull();
+  });
+
+  it("shows a friendly message when scans are rate-limited", async () => {
+    mockApi(async () => new Response("<html>429 Too Many Requests</html>", { status: 429 }));
+    await renderApp(true);
+    act(() => query<HTMLButtonElement>(".scan-button").click());
+    await waitForScan();
+
+    expect(query('[role="alert"]').textContent).toContain("Too many scans right now.");
   });
 
   it("blocks scans with an invalid region", async () => {

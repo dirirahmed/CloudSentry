@@ -5,8 +5,10 @@ import {
   BACKEND_UNREACHABLE,
   INVALID_REGION,
   INVALID_RESPONSE,
+  RATE_LIMITED,
   checkHealth,
   runScan,
+  sha256Hex,
 } from "./api";
 import { jsonResponse, makeScanResult } from "./test/fixtures";
 
@@ -65,6 +67,22 @@ describe("runScan", () => {
     expect((await captureError(runScan({ region: "xx", include_ai: false }))).message).toBe(INVALID_REGION);
   });
 
+  it("uses the rate-limit message from the server", async () => {
+    const detail = "Too many scans right now. Please wait a minute and try again.";
+    vi.stubGlobal("fetch", vi.fn(async () => jsonResponse({ detail }, 429)));
+
+    const error = await captureError(runScan({ include_ai: false }));
+
+    expect(error.status).toBe(429);
+    expect(error.message).toBe(detail);
+  });
+
+  it("falls back to a friendly rate-limit message", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("Too Many Requests", { status: 429 })));
+
+    expect((await captureError(runScan({ include_ai: false }))).message).toBe(RATE_LIMITED);
+  });
+
   it("treats a non-JSON gateway error as the backend being unavailable", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response("<html>502 Bad Gateway</html>", { status: 502 })));
 
@@ -81,6 +99,26 @@ describe("runScan", () => {
 
     expect(error.kind).toBe("invalid_response");
     expect(error.message).toBe(INVALID_RESPONSE);
+  });
+});
+
+describe("sha256Hex", () => {
+  it("hashes the request body the way AWS expects", async () => {
+    // sha256 of the exact JSON body, computed independently with Python's hashlib.
+    expect(await sha256Hex('{"region":"ca-central-1","include_ai":true}')).toBe(
+      "336ab94b64090bcc1a345b6c92aa163250c159a5b1b7016fae7a4b3f46bdb5b3",
+    );
+  });
+
+  it("sends the body hash with every scan", async () => {
+    const fetchMock = vi.fn(async () => jsonResponse(makeScanResult()));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await runScan({ region: "ca-central-1", include_ai: true });
+
+    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    const headers = init.headers as Record<string, string>;
+    expect(headers["x-amz-content-sha256"]).toBe(await sha256Hex(init.body as string));
   });
 });
 
